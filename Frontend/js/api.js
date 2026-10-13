@@ -1,6 +1,15 @@
 /**
  * API.JS - Tầng Dịch Vụ API Trừu Tượng Hóa (apiService)
  * Hỗ trợ chuyển đổi liền mạch giữa Mock Data (LocalStorage) và Spring Boot REST API
+ *
+ * Backend contract (demoss11 - TodoController, base: /api/v1/todos):
+ *   GET    /                  ?completed=&priority=&keyword=   -> List<TodoResponse>
+ *   GET    /{id}                                               -> TodoResponse
+ *   POST   /                  { title, description, priority, dueDate }
+ *   PUT    /{id}              { title*, description, completed, priority, dueDate }
+ *   PATCH  /{id}/toggle                                        -> TodoResponse
+ *   DELETE /{id}
+ * Mọi response được bọc trong ApiDataResponse { success, message, data, errors, httpStatus }
  */
 window.apiService = (() => {
   const MOCK_STORAGE_KEY = 'SPRING_BOOT_TODOS_MOCK_DATA_V1';
@@ -12,6 +21,7 @@ window.apiService = (() => {
     {
       id: 101,
       title: 'Tích hợp Spring Security & JWT cho hệ thống',
+      description: 'Cấu hình filter chain và sinh token',
       completed: false,
       priority: 'HIGH',
       dueDate: new Date(Date.now() + 86400000).toISOString().split('T')[0], // Ngày mai
@@ -20,6 +30,7 @@ window.apiService = (() => {
     {
       id: 102,
       title: 'Viết Unit Test JUnit 5 cho TodoService và Repository',
+      description: '',
       completed: true,
       priority: 'MEDIUM',
       dueDate: new Date().toISOString().split('T')[0], // Hôm nay
@@ -28,6 +39,7 @@ window.apiService = (() => {
     {
       id: 103,
       title: 'Cấu hình Dockerfile & GitHub Actions Dependency Caching',
+      description: '',
       completed: false,
       priority: 'LOW',
       dueDate: new Date(Date.now() + 2 * 86400000).toISOString().split('T')[0], // Ngày kia
@@ -62,45 +74,75 @@ window.apiService = (() => {
     return new Promise(resolve => setTimeout(resolve, delay));
   }
 
+  function findMockIndex(items, id) {
+    const index = items.findIndex(t => String(t.id) === String(id));
+    if (index === -1) throw new Error('Không tìm thấy công việc');
+    return index;
+  }
+
   /* --------------------------------------------------------------------------
      REAL API FETCH HELPER
      -------------------------------------------------------------------------- */
-  async function request(endpoint, options = {}) {
-    const defaultHeaders = {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    };
 
+  /**
+   * Gửi request tới backend và tự động bóc tách ApiDataResponse.
+   * @returns {Promise<any>} Trường `data` của ApiDataResponse
+   * @throws {Error} Error có thêm `fieldErrors` (Map field -> message) khi validate thất bại
+   */
+  async function request(endpoint, options = {}) {
     const config = {
       ...options,
       headers: {
-        ...defaultHeaders,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
         ...(options.headers || {})
       }
     };
 
+    let response;
     try {
-      const response = await fetch(endpoint, config);
+      response = await fetch(endpoint, config);
+    } catch (networkErr) {
+      console.error(`[API Error] Không kết nối được tới ${endpoint}:`, networkErr);
+      throw new Error('Không kết nối được tới Backend. Hãy kiểm tra server Spring Boot đã chạy ở cổng 8080 chưa.');
+    }
 
-      // Nếu xóa thành công trả về 204 No Content
-      if (response.status === 204) {
-        return null;
+    if (response.status === 204) return null;
+
+    let body = null;
+    try {
+      body = await response.json();
+    } catch (_) {
+      // Response không có body JSON
+    }
+
+    if (!response.ok || (body && body.success === false)) {
+      let message = (body && body.message) || `Lỗi HTTP: ${response.status} ${response.statusText}`;
+      const fieldErrors = body && body.errors && typeof body.errors === 'object' ? body.errors : null;
+      if (fieldErrors) {
+        const details = Object.values(fieldErrors).join('; ');
+        if (details) message = `${message}: ${details}`;
       }
-
-      if (!response.ok) {
-        let errorDetail = `Lỗi HTTP: ${response.status} ${response.statusText}`;
-        try {
-          const errJson = await response.json();
-          if (errJson.message) errorDetail = errJson.message;
-        } catch (_) {}
-        throw new Error(errorDetail);
-      }
-
-      return await response.json();
-    } catch (error) {
-      console.error(`[API Error] Yêu cầu tới ${endpoint} thất bại:`, error);
+      const error = new Error(message);
+      error.status = response.status;
+      error.fieldErrors = fieldErrors;
+      console.error(`[API Error] ${config.method || 'GET'} ${endpoint}:`, body || response.statusText);
       throw error;
     }
+
+    // Bóc ApiDataResponse -> data
+    return body && Object.prototype.hasOwnProperty.call(body, 'data') ? body.data : body;
+  }
+
+  /** Chuẩn hóa payload cho PUT (backend ghi đè toàn bộ, title bắt buộc) */
+  function buildUpdatePayload(todo) {
+    return {
+      title: (todo.title || '').trim(),
+      description: todo.description || null,
+      completed: !!todo.completed,
+      priority: todo.priority || 'MEDIUM',
+      dueDate: todo.dueDate || null
+    };
   }
 
   /* --------------------------------------------------------------------------
@@ -108,38 +150,59 @@ window.apiService = (() => {
      -------------------------------------------------------------------------- */
   return {
     /**
-     * Lấy danh sách công việc (có hỗ trợ tìm kiếm từ khóa)
-     * @param {string} search - Từ khóa tìm kiếm (tùy chọn)
+     * Lấy danh sách công việc
+     * @param {Object} filters - { keyword, priority, completed } (đều tùy chọn)
      * @returns {Promise<Array>} Danh sách Todos
      */
-    async getTodos(search = '') {
+    async getTodos(filters = {}) {
+      const { keyword = '', priority = '', completed = null } = filters;
+
       if (window.CONFIG.USE_MOCK) {
         await simulateNetworkDelay();
         let items = getMockStorage();
-        if (search && search.trim()) {
-          const q = search.trim().toLowerCase();
+        if (keyword && keyword.trim()) {
+          const q = keyword.trim().toLowerCase();
           items = items.filter(t => t.title.toLowerCase().includes(q));
         }
+        if (priority) items = items.filter(t => t.priority === priority);
+        if (completed !== null && completed !== undefined) items = items.filter(t => !!t.completed === completed);
         return items;
       }
 
-      const queryParam = search ? `?search=${encodeURIComponent(search.trim())}` : '';
-      return await request(`${window.CONFIG.API_BASE_URL}${queryParam}`, {
-        method: 'GET'
-      });
+      const params = new URLSearchParams();
+      if (keyword && keyword.trim()) params.append('keyword', keyword.trim());
+      if (priority) params.append('priority', priority);
+      if (completed !== null && completed !== undefined) params.append('completed', String(completed));
+      const qs = params.toString();
+
+      const data = await request(`${window.CONFIG.API_BASE_URL}${qs ? `?${qs}` : ''}`, { method: 'GET' });
+      return Array.isArray(data) ? data : [];
+    },
+
+    /**
+     * Lấy chi tiết một công việc
+     * @param {number|string} id
+     */
+    async getTodoById(id) {
+      if (window.CONFIG.USE_MOCK) {
+        await simulateNetworkDelay();
+        const items = getMockStorage();
+        return items[findMockIndex(items, id)];
+      }
+      return await request(`${window.CONFIG.API_BASE_URL}/${id}`, { method: 'GET' });
     },
 
     /**
      * Tạo mới một công việc
-     * @param {Object} data - { title, priority, dueDate }
+     * @param {Object} data - { title, description, priority, dueDate }
      * @returns {Promise<Object>} Todo vừa tạo
      */
     async createTodo(data) {
       const payload = {
         title: data.title.trim(),
+        description: data.description ? data.description.trim() : null,
         priority: data.priority || 'MEDIUM',
-        dueDate: data.dueDate || null,
-        completed: false
+        dueDate: data.dueDate || null
       };
 
       if (window.CONFIG.USE_MOCK) {
@@ -147,6 +210,7 @@ window.apiService = (() => {
         const items = getMockStorage();
         const newTodo = {
           ...payload,
+          completed: false,
           id: Date.now(), // Giả lập ID kiểu Long/Number
           createdAt: new Date().toISOString()
         };
@@ -162,27 +226,46 @@ window.apiService = (() => {
     },
 
     /**
-     * Cập nhật thông tin công việc (tiêu đề, trạng thái completed, priority, dueDate)
+     * Cập nhật công việc (PUT ghi đè toàn bộ).
+     * Truyền vào todo hiện tại + các thay đổi để không làm mất dữ liệu (description, dueDate...).
      * @param {number|string} id - Mã định danh Todo
-     * @param {Object} data - Các trường cần cập nhật
+     * @param {Object} todo - Đối tượng todo đầy đủ sau khi đã áp thay đổi
      * @returns {Promise<Object>} Todo sau cập nhật
      */
-    async updateTodo(id, data) {
+    async updateTodo(id, todo) {
+      const payload = buildUpdatePayload(todo);
+
       if (window.CONFIG.USE_MOCK) {
         await simulateNetworkDelay();
         const items = getMockStorage();
-        const index = items.findIndex(t => t.id === Number(id) || t.id === id);
-        if (index === -1) throw new Error('Không tìm thấy công việc cần sửa');
-
-        items[index] = { ...items[index], ...data };
+        const index = findMockIndex(items, id);
+        items[index] = { ...items[index], ...payload, updatedAt: new Date().toISOString() };
         setMockStorage(items);
         return items[index];
       }
 
       return await request(`${window.CONFIG.API_BASE_URL}/${id}`, {
         method: 'PUT',
-        body: JSON.stringify(data)
+        body: JSON.stringify(payload)
       });
+    },
+
+    /**
+     * Đảo trạng thái hoàn thành (PATCH /{id}/toggle)
+     * @param {number|string} id
+     * @returns {Promise<Object>} Todo sau khi toggle
+     */
+    async toggleTodo(id) {
+      if (window.CONFIG.USE_MOCK) {
+        await simulateNetworkDelay();
+        const items = getMockStorage();
+        const index = findMockIndex(items, id);
+        items[index] = { ...items[index], completed: !items[index].completed };
+        setMockStorage(items);
+        return items[index];
+      }
+
+      return await request(`${window.CONFIG.API_BASE_URL}/${id}/toggle`, { method: 'PATCH' });
     },
 
     /**
@@ -193,45 +276,32 @@ window.apiService = (() => {
     async deleteTodo(id) {
       if (window.CONFIG.USE_MOCK) {
         await simulateNetworkDelay();
-        let items = getMockStorage();
-        items = items.filter(t => t.id !== Number(id) && t.id !== id);
+        const items = getMockStorage().filter(t => String(t.id) !== String(id));
         setMockStorage(items);
         return true;
       }
 
-      await request(`${window.CONFIG.API_BASE_URL}/${id}`, {
-        method: 'DELETE'
-      });
+      await request(`${window.CONFIG.API_BASE_URL}/${id}`, { method: 'DELETE' });
       return true;
     },
 
     /**
-     * Xóa tất cả các công việc đã hoàn thành
-     * @returns {Promise<boolean>}
+     * Xóa tất cả các công việc đã hoàn thành.
+     * Backend không có endpoint batch nên lấy danh sách completed=true rồi xóa từng mục.
+     * @returns {Promise<number>} Số công việc đã xóa
      */
     async clearCompleted() {
       if (window.CONFIG.USE_MOCK) {
         await simulateNetworkDelay();
-        let items = getMockStorage();
-        items = items.filter(t => !t.completed);
-        setMockStorage(items);
-        return true;
+        const items = getMockStorage();
+        const remaining = items.filter(t => !t.completed);
+        setMockStorage(remaining);
+        return items.length - remaining.length;
       }
 
-      // Đối với Backend, gọi endpoint batch delete nếu có,
-      // hoặc xóa từng mục nếu backend thiết kế chuẩn CRUD đơn lẻ
-      try {
-        await request(`${window.CONFIG.API_BASE_URL}/completed`, {
-          method: 'DELETE'
-        });
-      } catch (err) {
-        // Fallback: nếu backend chưa viết endpoint /completed, tự lấy danh sách và xóa từng cái
-        console.warn('Backend chưa có endpoint DELETE /api/todos/completed, thực hiện xóa fallback...');
-        const currentTodos = await this.getTodos();
-        const completedItems = currentTodos.filter(t => t.completed);
-        await Promise.all(completedItems.map(item => this.deleteTodo(item.id)));
-      }
-      return true;
+      const completedItems = await this.getTodos({ completed: true });
+      await Promise.all(completedItems.map(item => this.deleteTodo(item.id)));
+      return completedItems.length;
     }
   };
 })();

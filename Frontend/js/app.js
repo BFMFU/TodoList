@@ -7,9 +7,11 @@ document.addEventListener('DOMContentLoaded', () => {
   const state = {
     todos: [],
     filter: 'ALL', // 'ALL' | 'ACTIVE' | 'COMPLETED'
+    priorityFilter: '', // '' | 'HIGH' | 'MEDIUM' | 'LOW' (gửi lên backend)
     searchQuery: '',
     isLoading: false,
     editingId: null,
+    isSaving: false,
     searchTimeout: null
   };
 
@@ -21,6 +23,7 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // Form Inputs
     newTodoTitle: document.getElementById('newTodoTitle'),
+    newTodoDescription: document.getElementById('newTodoDescription'),
     newTodoPriority: document.getElementById('newTodoPriority'),
     newTodoDueDate: document.getElementById('newTodoDueDate'),
     addTodoBtn: document.getElementById('addTodoBtn'),
@@ -28,6 +31,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Search & Filter
     searchInput: document.getElementById('searchInput'),
     clearSearchBtn: document.getElementById('clearSearchBtn'),
+    priorityFilter: document.getElementById('priorityFilter'),
     filterBtns: document.querySelectorAll('.filter-btn'),
     
     // Counts & Progress
@@ -162,13 +166,35 @@ document.addEventListener('DOMContentLoaded', () => {
   async function fetchTodos() {
     setLoading(true);
     try {
-      state.todos = await window.apiService.getTodos(state.searchQuery);
+      // Lọc keyword + priority ở backend; lọc trạng thái (Đang làm/Đã xong) ở client để đếm số lượng chính xác
+      state.todos = await window.apiService.getTodos({
+        keyword: state.searchQuery,
+        priority: state.priorityFilter
+      });
       renderUI();
     } catch (err) {
+      state.todos = [];
+      renderUI();
       showToast(`Không thể tải dữ liệu: ${err.message}`, 'error');
     } finally {
       setLoading(false);
     }
+  }
+
+  function findTodo(id) {
+    return state.todos.find(t => String(t.id) === String(id));
+  }
+
+  function replaceTodo(updated) {
+    const index = state.todos.findIndex(t => String(t.id) === String(updated.id));
+    if (index !== -1) state.todos[index] = updated;
+  }
+
+  /** Kiểm tra todo có khớp bộ lọc đang gửi lên server hay không */
+  function matchesServerFilters(todo) {
+    if (state.priorityFilter && todo.priority !== state.priorityFilter) return false;
+    if (state.searchQuery && !todo.title.toLowerCase().includes(state.searchQuery.toLowerCase())) return false;
+    return true;
   }
 
   async function handleAddTodo() {
@@ -178,16 +204,20 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
+    const description = el.newTodoDescription ? el.newTodoDescription.value.trim() : '';
     const priority = el.newTodoPriority.value;
     const dueDate = el.newTodoDueDate.value || null;
 
+    el.addTodoBtn.disabled = true;
     try {
-      const created = await window.apiService.createTodo({ title, priority, dueDate });
-      // Thêm vào danh sách state
-      state.todos.unshift(created);
-      
+      const created = await window.apiService.createTodo({ title, description, priority, dueDate });
+      if (created && matchesServerFilters(created)) {
+        state.todos.unshift(created);
+      }
+
       // Reset form
       el.newTodoTitle.value = '';
+      if (el.newTodoDescription) el.newTodoDescription.value = '';
       el.newTodoDueDate.value = '';
       el.newTodoPriority.value = 'MEDIUM';
       el.newTodoTitle.focus();
@@ -196,27 +226,33 @@ document.addEventListener('DOMContentLoaded', () => {
       showToast('Đã thêm công việc thành công', 'success');
     } catch (err) {
       showToast(`Lỗi khi tạo công việc: ${err.message}`, 'error');
+    } finally {
+      el.addTodoBtn.disabled = false;
     }
   }
 
   async function handleToggleComplete(id) {
-    const todo = state.todos.find(t => t.id === id);
+    const todo = findTodo(id);
     if (!todo) return;
 
-    const newCompleted = !todo.completed;
     try {
-      await window.apiService.updateTodo(id, { completed: newCompleted });
-      todo.completed = newCompleted;
+      // PATCH /api/v1/todos/{id}/toggle
+      const updated = await window.apiService.toggleTodo(id);
+      replaceTodo(updated || { ...todo, completed: !todo.completed });
       renderUI();
     } catch (err) {
+      renderUI(); // Hoàn tác trạng thái checkbox trên UI
       showToast(`Lỗi khi cập nhật trạng thái: ${err.message}`, 'error');
     }
   }
 
   async function handleDeleteTodo(id) {
+    const todo = findTodo(id);
+    if (todo && !confirm(`Xóa công việc "${todo.title}"?`)) return;
+
     try {
       await window.apiService.deleteTodo(id);
-      state.todos = state.todos.filter(t => t.id !== id);
+      state.todos = state.todos.filter(t => String(t.id) !== String(id));
       renderUI();
       showToast('Đã xóa công việc', 'info');
     } catch (err) {
@@ -224,23 +260,54 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  async function handleSaveEdit(id, newTitle) {
-    const title = newTitle.trim();
+  function startEdit(id) {
+    if (String(state.editingId) === String(id)) return;
+    state.editingId = id;
+    renderUI();
+  }
+
+  function cancelEdit() {
+    state.editingId = null;
+    renderUI();
+  }
+
+  async function handleSaveEdit(id) {
+    if (state.isSaving) return;
+    const todo = findTodo(id);
+    if (!todo) return cancelEdit();
+
+    const titleEl = document.getElementById(`edit-title-${id}`);
+    const descEl = document.getElementById(`edit-desc-${id}`);
+    const priorityEl = document.getElementById(`edit-priority-${id}`);
+    const dueEl = document.getElementById(`edit-due-${id}`);
+
+    const title = titleEl ? titleEl.value.trim() : todo.title;
     if (!title) {
-      state.editingId = null;
-      renderUI();
+      showToast('Tiêu đề công việc không được để trống', 'error');
+      if (titleEl) titleEl.focus();
       return;
     }
 
+    // PUT ghi đè toàn bộ -> gửi đầy đủ các trường để không mất dữ liệu
+    const merged = {
+      ...todo,
+      title,
+      description: descEl ? descEl.value.trim() : todo.description,
+      priority: priorityEl ? priorityEl.value : todo.priority,
+      dueDate: dueEl ? (dueEl.value || null) : todo.dueDate
+    };
+
+    state.isSaving = true;
     try {
-      await window.apiService.updateTodo(id, { title });
-      const todo = state.todos.find(t => t.id === id);
-      if (todo) todo.title = title;
+      const updated = await window.apiService.updateTodo(id, merged);
+      replaceTodo(updated || merged);
       state.editingId = null;
       renderUI();
-      showToast('Đã cập nhật tiêu đề công việc', 'success');
+      showToast('Đã cập nhật công việc', 'success');
     } catch (err) {
       showToast(`Lỗi cập nhật: ${err.message}`, 'error');
+    } finally {
+      state.isSaving = false;
     }
   }
 
@@ -250,14 +317,15 @@ document.addEventListener('DOMContentLoaded', () => {
       showToast('Không có việc hoàn thành nào để xóa', 'info');
       return;
     }
+    if (!confirm('Xóa tất cả công việc đã hoàn thành?')) return;
 
     try {
-      await window.apiService.clearCompleted();
-      state.todos = state.todos.filter(t => !t.completed);
-      renderUI();
-      showToast(`Đã xóa ${completedCount} việc đã hoàn thành`, 'success');
+      const deleted = await window.apiService.clearCompleted();
+      showToast(`Đã xóa ${deleted} việc đã hoàn thành`, 'success');
     } catch (err) {
       showToast(`Lỗi dọn dẹp: ${err.message}`, 'error');
+    } finally {
+      await fetchTodos(); // Đồng bộ lại với backend
     }
   }
 
@@ -280,12 +348,8 @@ document.addEventListener('DOMContentLoaded', () => {
       if (state.filter === 'ACTIVE' && todo.completed) return false;
       if (state.filter === 'COMPLETED' && !todo.completed) return false;
 
-      // Filter search
-      if (state.searchQuery) {
-        const q = state.searchQuery.toLowerCase();
-        if (!todo.title.toLowerCase().includes(q)) return false;
-      }
-      return true;
+      // Backend ưu tiên keyword hơn priority, nên lọc lại ở client để kết hợp cả hai
+      return matchesServerFilters(todo);
     });
   }
 
@@ -344,7 +408,7 @@ document.addEventListener('DOMContentLoaded', () => {
     el.emptyState.style.display = 'none';
 
     el.todoListContainer.innerHTML = filtered.map(todo => {
-      const isEditing = state.editingId === todo.id;
+      const isEditing = String(state.editingId) === String(todo.id);
       
       // Priority badge styles
       let priorityBadge = '';
@@ -391,15 +455,38 @@ document.addEventListener('DOMContentLoaded', () => {
       }
 
       if (isEditing) {
+        const p = todo.priority || 'MEDIUM';
         return `
-          <div class="task-item-enter p-3.5 bg-white dark:bg-slate-800/90 border-2 border-indigo-500 rounded-xl shadow-md">
+          <div class="task-item-enter p-3.5 bg-white dark:bg-slate-800/90 border-2 border-indigo-500 rounded-xl shadow-md flex flex-col gap-2" data-editing="true">
             <input 
               type="text" 
-              id="edit-input-${todo.id}" 
-              class="w-full px-2 py-1 text-sm bg-transparent text-slate-900 dark:text-white outline-none"
+              id="edit-title-${todo.id}" 
+              maxlength="150"
+              class="w-full px-2 py-1 text-sm font-medium bg-transparent text-slate-900 dark:text-white outline-none border-b border-slate-200 dark:border-slate-700"
               value="${escapeHtml(todo.title)}"
-              data-id="${todo.id}"
+              placeholder="Tiêu đề công việc"
             />
+            <textarea
+              id="edit-desc-${todo.id}"
+              rows="2"
+              maxlength="1000"
+              class="w-full px-2 py-1 text-xs bg-transparent text-slate-600 dark:text-slate-300 outline-none resize-none"
+              placeholder="Mô tả (tùy chọn)"
+            >${escapeHtml(todo.description || '')}</textarea>
+            <div class="flex items-center justify-between flex-wrap gap-2">
+              <div class="flex items-center gap-2 flex-wrap">
+                <select id="edit-priority-${todo.id}" class="text-xs font-semibold px-2 py-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-300 outline-none">
+                  <option value="HIGH" ${p === 'HIGH' ? 'selected' : ''}>Ưu tiên: Cao</option>
+                  <option value="MEDIUM" ${p === 'MEDIUM' ? 'selected' : ''}>Ưu tiên: Vừa</option>
+                  <option value="LOW" ${p === 'LOW' ? 'selected' : ''}>Ưu tiên: Thấp</option>
+                </select>
+                <input type="date" id="edit-due-${todo.id}" value="${todo.dueDate || ''}" class="text-xs px-2 py-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 outline-none" />
+              </div>
+              <div class="flex items-center gap-1.5">
+                <button type="button" data-action="cancel-edit" data-id="${todo.id}" class="px-3 py-1 text-xs font-semibold rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors">Hủy</button>
+                <button type="button" data-action="save-edit" data-id="${todo.id}" class="px-3 py-1 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white transition-colors">Lưu</button>
+              </div>
+            </div>
           </div>
         `;
       }
@@ -427,6 +514,7 @@ document.addEventListener('DOMContentLoaded', () => {
             <p class="text-sm font-medium ${todo.completed ? 'line-through text-slate-400 dark:text-slate-500' : 'text-slate-800 dark:text-slate-100'} truncate select-none">
               ${escapeHtml(todo.title)}
             </p>
+            ${todo.description ? `<p class="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5 select-none">${escapeHtml(todo.description)}</p>` : ''}
             <div class="flex items-center gap-2 mt-1 flex-wrap">
               ${priorityBadge}
               ${dueDateBadge}
@@ -463,22 +551,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }).join('');
 
     // Focus input if editing
-    if (state.editingId) {
-      const editInput = document.getElementById(`edit-input-${state.editingId}`);
-      if (editInput) {
-        editInput.focus();
-        editInput.select();
-        
-        editInput.addEventListener('keydown', (e) => {
-          if (e.key === 'Enter') handleSaveEdit(state.editingId, editInput.value);
-          if (e.key === 'Escape') {
-            state.editingId = null;
-            renderUI();
-          }
-        });
-        editInput.addEventListener('blur', () => {
-          handleSaveEdit(state.editingId, editInput.value);
-        });
+    if (state.editingId !== null) {
+      const editTitle = document.getElementById(`edit-title-${state.editingId}`);
+      if (editTitle) {
+        editTitle.focus();
+        editTitle.select();
       }
     }
   }
@@ -496,7 +573,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
 
-    // Delegated actions for Todo List (toggle, edit, delete)
+    // Delegated actions for Todo List (toggle, edit, delete, save/cancel edit)
     el.todoListContainer.addEventListener('click', (e) => {
       const target = e.target.closest('[data-action]');
       if (!target) return;
@@ -509,18 +586,32 @@ document.addEventListener('DOMContentLoaded', () => {
       } else if (action === 'delete') {
         handleDeleteTodo(id);
       } else if (action === 'edit') {
-        state.editingId = id;
-        renderUI();
+        startEdit(id);
+      } else if (action === 'save-edit') {
+        handleSaveEdit(id);
+      } else if (action === 'cancel-edit') {
+        cancelEdit();
+      }
+    });
+
+    // Phím tắt trong form sửa: Enter (ở ô tiêu đề) = Lưu, Escape = Hủy
+    el.todoListContainer.addEventListener('keydown', (e) => {
+      if (state.editingId === null) return;
+      if (e.key === 'Escape') {
+        cancelEdit();
+      } else if (e.key === 'Enter' && e.target.id === `edit-title-${state.editingId}`) {
+        e.preventDefault();
+        handleSaveEdit(state.editingId);
       }
     });
 
     // Double-click to edit
     el.todoListContainer.addEventListener('dblclick', (e) => {
+      if (e.target.closest('[data-editing]')) return;
       const taskRow = e.target.closest('[data-id]');
       if (taskRow) {
         const id = Number(taskRow.dataset.id) || taskRow.dataset.id;
-        state.editingId = id;
-        renderUI();
+        startEdit(id);
       }
     });
 
@@ -539,33 +630,33 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     });
 
-    // Debounced Search Input
+    // Priority Filter -> gọi backend ?priority=
+    if (el.priorityFilter) {
+      el.priorityFilter.addEventListener('change', () => {
+        state.priorityFilter = el.priorityFilter.value;
+        fetchTodos();
+      });
+    }
+
+    // Debounced Search Input -> gọi backend ?keyword=
     el.searchInput.addEventListener('input', (e) => {
       clearTimeout(state.searchTimeout);
       const query = e.target.value.trim();
-      el.clearSearchBtn.style.display = query ? 'block' : 'none';
+      el.clearSearchBtn.style.display = query ? 'flex' : 'none';
 
       state.searchTimeout = setTimeout(() => {
         state.searchQuery = query;
-        // Nếu dùng API thì fetch lại, nếu dùng Mock thì render lại
-        if (window.CONFIG.USE_MOCK) {
-          renderUI();
-        } else {
-          fetchTodos();
-        }
+        fetchTodos();
       }, window.CONFIG.SEARCH_DEBOUNCE_MS || 300);
     });
 
     // Clear Search button
     el.clearSearchBtn.addEventListener('click', () => {
+      clearTimeout(state.searchTimeout);
       el.searchInput.value = '';
       state.searchQuery = '';
       el.clearSearchBtn.style.display = 'none';
-      if (window.CONFIG.USE_MOCK) {
-        renderUI();
-      } else {
-        fetchTodos();
-      }
+      fetchTodos();
     });
 
     // Clear Completed Tasks
